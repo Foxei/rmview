@@ -4,10 +4,7 @@ from PyQt5.QtWidgets import *
 
 
 import paramiko
-import struct
-import time
 
-import sys
 import os
 import logging
 log = logging.getLogger('rmview')

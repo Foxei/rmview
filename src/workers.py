@@ -1,15 +1,11 @@
 from PyQt5.QtGui import *
-from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 
 from rmparams import *
 
-import paramiko
 import struct
 import time
 
-import sys
-import os
 import logging
 log = logging.getLogger('rmview')
 
@@ -17,6 +13,7 @@ from lz4framed import Decompressor, Lz4FramedNoDataError
 
 try:
   GRAY16 = QImage.Format_Grayscale16
+  GRAY8 = QImage.Format_Grayscale8
 except Exception:
   GRAY16 = QImage.Format_RGB16
 RGB16 = QImage.Format_RGB16
@@ -33,16 +30,61 @@ class FrameBufferWorker(QRunnable):
 
   _stop = False
 
-  def __init__(self, ssh, delay=None, lz4_path=None, img_format=GRAY16):
+  def __init__(self, ssh, delay=None, lz4_path=None, rmhead_path=None, img_format=GRAY8):
     super(FrameBufferWorker, self).__init__()
-    self._read_loop = """\
-      while dd if=/dev/fb0 count=1 bs={bytes} 2>/dev/null; do {delay}; done | {lz4_path}\
-    """.format(bytes=TOTAL_BYTES,
-               delay="sleep "+str(delay) if delay else "true",
-               lz4_path=lz4_path or "$HOME/lz4")
+    #"dd if=/proc/$pid/mem bs=$page_size skip=$window_start_blocks count=$window_length_blocks 2>/dev/null | tail -c+$window_offset | reMarkable-test -c $window_bytes"
+
     self.ssh = ssh
+    self.pid = self.get_process_id()
+    self.skip_bytes = self.get_bytes_to_skip()
+    self.window_start_blocks = self.get_window_start_block()
+    self.window_offset = self.get_window_offset()
+    self.window_length_blocks = self.get_window_length_blocks()
+
     self.img_format = img_format
     self.signals = FBWSignals()
+
+    self._read_loop = """\
+     while dd if=/proc/{pid}/mem bs={page_size} skip={window_start_blocks} count={window_length_blocks} 2>/dev/null | tail -c+{window_offset} | {rmhead_path} -c {window_bytes}; do true; done | {lz4_path}\
+     """.format(pid=self.pid,
+                page_size=PAGE_SIZE,
+                window_offset=self.window_offset,
+                window_start_blocks=self.window_start_blocks,
+                window_length_blocks=self.window_length_blocks,
+                window_bytes=WINDOW_BYTES,
+                delay="sleep " + str(delay) if delay else "true",
+                lz4_path=lz4_path or "$HOME/lz4",
+                rmhead_path=rmhead_path or "$HOME/rmhead")
+
+  def get_process_id(self):
+    command = "pidof xochitl"
+    log.info("Execution ssh command: %s", command)
+
+    _, rmout, rmerr = self.ssh.exec_command("pidof xochitl")
+    pid = int(rmout.read().decode('utf-8'))
+    log.info("Process id extracted: %i", pid)
+
+    return pid
+
+  def get_bytes_to_skip(self):
+    command = "grep -C1 '/dev/fb0' /proc/{pid}/maps | tail -n1 | sed 's/-.*$//'".format(pid=self.pid)
+    log.info("Execution ssh command: %s", command)
+    _, rmout, rmerr = self.ssh.exec_command(command)
+
+    mem_location_string = "0x{bytes}".format(bytes=rmout.read().decode('utf-8'))
+    mem_location_int = int(mem_location_string, 16)+8
+    log.info("Memory location extracted: %s", mem_location_string)
+    log.info("Bytes to skip: %i", mem_location_int)
+    return mem_location_int
+
+  def get_window_start_block(self):
+    return int(self.skip_bytes/PAGE_SIZE)
+
+  def get_window_offset(self):
+    return int(self.skip_bytes % PAGE_SIZE)
+
+  def get_window_length_blocks(self):
+    return int(WINDOW_BYTES / PAGE_SIZE + 1)
 
   def stop(self):
     self._stop = True
@@ -50,6 +92,7 @@ class FrameBufferWorker(QRunnable):
   @pyqtSlot()
   def run(self):
 
+    log.info("Execution ssh command: %s", self._read_loop)
     _, rmstream, rmerr = self.ssh.exec_command(self._read_loop)
 
     data = b''
@@ -61,10 +104,10 @@ class FrameBufferWorker(QRunnable):
     try:
       for chunk in Decompressor(rmstream):
         data += chunk
-        while len(data) >= TOTAL_BYTES:
-          pix = data[:TOTAL_BYTES]
-          data = data[TOTAL_BYTES:]
-          self.signals.onNewFrame.emit(QImage(pix, WIDTH, HEIGHT, WIDTH * 2, self.img_format))
+        while len(data) >= WINDOW_BYTES:
+          pix = data[:WINDOW_BYTES]
+          data = data[WINDOW_BYTES:]
+          self.signals.onNewFrame.emit(QImage(pix, WIDTH, HEIGHT, WIDTH, self.img_format))
           if SHOW_FPS:
             f += 1
             if f % 10 == 0:

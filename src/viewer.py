@@ -58,6 +58,9 @@ class QtImageViewer(QGraphicsView):
     self._fit = True
     self._rotation = 0 # used to produce a rotated screenshot
 
+    # Hot fix for rotation on the rM2.
+    self.rotate(180)
+
   def contextMenuEvent(self, event):
     self.fitAction.setChecked(self._fit)
     self.menu.exec_(self.mapToGlobal(event.pos()))
